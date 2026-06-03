@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>myproject.ptd — PalmtreeDev .PTD Example</title>
+<style>
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  max-width: 720px;
+  margin: 4em auto;
+  padding: 0 2em;
+  line-height: 1.6;
+  color: #e0e0e0;
+  background: #0d1117;
+}
+h1 {
+  font-size: 2.5em;
+  color: #58a6ff;
+  margin-bottom: 0.2em;
+}
+h1 span {
+  color: #8b949e;
+  font-size: 0.5em;
+  display: block;
+  font-weight: normal;
+}
+.tagline {
+  font-size: 1.1em;
+  color: #8b949e;
+  border-left: 3px solid #58a6ff;
+  padding-left: 1em;
+  margin: 1.5em 0;
+}
+.card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1.5em 2em;
+  margin: 2em 0;
+}
+.card h2 {
+  color: #58a6ff;
+  margin-top: 0;
+}
+a {
+  color: #58a6ff;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+.btn {
+  display: inline-block;
+  background: #238636;
+  color: #fff;
+  padding: 0.7em 1.5em;
+  border-radius: 6px;
+  font-weight: 600;
+  margin-top: 0.5em;
+}
+.btn:hover {
+  background: #2ea043;
+  text-decoration: none;
+}
+code {
+  background: #21262d;
+  padding: 0.2em 0.5em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+footer {
+  margin-top: 3em;
+  font-size: 0.85em;
+  color: #484f58;
+  text-align: center;
+}
+</style>
+</head>
+<body>
+
+<h1>
+  myproject.ptd
+  <span>.PTD Local Domain Example</span>
+</h1>
+
+<div class="tagline">
+  A solo developer's playground — made by PalmtreeDev (aka palmtreemc)
+</div>
+
+<div class="card">
+  <h2>What is this?</h2>
+  <p>
+    This is an example site running on a local <strong>.ptd</strong>
+    (PalmtreeDev Domain) top-level domain. Every <code>*.ptd</code>
+    domain resolves to <code>127.0.0.1</code> on this machine, served
+    by dnsmasq + nginx.
+  </p>
+</div>
+
+<div class="card">
+  <h2>About the Developer</h2>
+  <p>
+    I'm <strong>PalmtreeDev</strong> — a solo full-stack developer.
+    You can find me on Discord as <strong>palmtreemc</strong>.
+  </p>
+  <p>
+    <a class="btn" href="https://guns.lol/palmtreemc" target="_blank" rel="noopener">
+      guns.lol/palmtreemc
+    </a>
+  </p>
+</div>
+
+<div class="card">
+  <h2>Getting Started</h2>
+  <p>
+    Create your own <code>.ptd</code> projects by adding directories
+    to <code>/var/www/ptd/</code> and running:
+  </p>
+  <p><code>sudo /usr/local/bin/ptd add &lt;project-name&gt;</code></p>
+  <p>
+    Each project is immediately available at
+    <code>http://&lt;project-name&gt;.ptd/</code>
+  </p>
+</div>
+
+<div class="card">
+  <h2>License</h2>
+  <p>
+    This <strong>.PTD</strong> domain system is licensed under the
+    <a href="https://www.apache.org/licenses/LICENSE-2.0" target="_blank" rel="noopener">
+      Apache License, Version 2.0
+    </a>. Acceptance was required when you first accessed this page.
+  </p>
+  <p>
+    <a href="/__ptd-accept-license">Re-accept the license</a>
+  </p>
+</div>
+
+<footer>
+  PalmtreeDev &middot; .PTD Local TLD &middot; openSUSE Tumbleweed
+</footer>
+
+</body>
+</html>

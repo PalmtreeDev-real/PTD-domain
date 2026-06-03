@@ -1,0 +1,1127 @@
+#!/bin/bash
+#
+# ptd - PalmTreeDev Domain (.ptd) local TLD manager
+# Version 1.0.0
+#
+# Automates creation and management of a local-only .ptd top-level domain
+# on openSUSE Tumbleweed using dnsmasq + nginx.
+#
+# Usage: ptd <command> [<args>]
+#
+# Commands:
+#   install          Set up dnsmasq + nginx + system DNS for .ptd
+#   uninstall        Remove all .ptd configuration and restore system
+#   add <name>       Create a new .ptd project in /var/www/ptd/<name>/
+#   remove <name>    Delete a .ptd project
+#   list             List all .ptd projects
+#   status           Show service and DNS status
+#   restart          Restart dnsmasq + nginx services
+#   help             Show this help message
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+readonly PTD_ROOT="/var/www/ptd"
+readonly DNSMASQ_CONF="/etc/dnsmasq.d/ptd.conf"
+readonly NGINX_CONF="/etc/nginx/conf.d/ptd.conf"
+readonly STATE_DIR="/var/lib/ptd"
+readonly ORIG_DNS_FILE="$STATE_DIR/orig_dns"
+readonly UPSTREAM_DNS_FILE="$STATE_DIR/upstream_dns"
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly CYAN='\033[0;36m'
+readonly NC='\033[0m'
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: ptd <command> [<args>]
+
+Commands:
+    install          Install and configure DNS + web server for .ptd TLD
+    uninstall        Remove all .ptd configuration and restore system DNS
+    add <name>       Create a new .ptd project served at http://<name>.ptd/
+    remove <name>    Delete a .ptd project
+    list             List all .ptd projects
+    status           Show service, DNS, and project status
+    restart          Restart dnsmasq and nginx services
+    help             Show this help message
+
+Examples:
+    sudo ptd install
+    sudo ptd add myproject     # http://myproject.ptd/
+    ptd list
+    sudo ptd remove myproject
+    sudo ptd uninstall
+
+Files:
+    Projects root:  $PTD_ROOT
+    DNS config:     $DNSMASQ_CONF
+    Nginx config:   $NGINX_CONF
+EOF
+}
+
+die() {
+    echo -e "${RED}Error: $*${NC}" >&2
+    exit 1
+}
+
+warn() {
+    echo -e "${YELLOW}Warning: $*${NC}"
+}
+
+info() {
+    echo -e "${CYAN}==>${NC} $*"
+}
+
+success() {
+    echo -e "${GREEN}==>${NC} $*"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        die "This command requires root privileges. Run with: sudo ptd $*"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# DNS helpers
+# ---------------------------------------------------------------------------
+detect_upstream_dns() {
+    local dns_servers=()
+    local ns
+
+    # Method 1: systemd-resolved
+    if command -v resolvectl &>/dev/null; then
+        while IFS= read -r line; do
+            if [[ $line =~ ^[[:space:]]*DNS[[:space:]]+Servers:[[:space:]]*(.+) ]]; then
+                for ns in ${BASH_REMATCH[1]}; do
+                    if [[ "$ns" != "127.0.0.1" && "$ns" != "127.0.0.53" && "$ns" != "::1" ]]; then
+                        dns_servers+=("$ns")
+                    fi
+                done
+            fi
+        done < <(resolvectl status 2>/dev/null || true)
+    fi
+
+    # Method 2: NetworkManager
+    if [[ ${#dns_servers[@]} -eq 0 ]] && command -v nmcli &>/dev/null; then
+        local devs
+        devs=$(nmcli -t -f DEVICE device status 2>/dev/null | grep -v '^lo$' | grep -v '^$' || true)
+        while IFS= read -r dev; do
+            [[ -z "$dev" ]] && continue
+            while IFS= read -r dns_line; do
+                ns="${dns_line#DNS:}"
+                if [[ "$ns" != "127.0.0.1" && "$ns" != "127.0.0.53" && "$ns" != "::1" && -n "$ns" ]]; then
+                    dns_servers+=("$ns")
+                fi
+            done < <(nmcli -t device show "$dev" 2>/dev/null | grep '^DNS:' || true)
+        done <<< "$devs"
+    fi
+
+    # Method 3: /etc/resolv.conf
+    if [[ ${#dns_servers[@]} -eq 0 ]] && [[ -f /etc/resolv.conf ]]; then
+        while read -r line; do
+            if [[ $line =~ ^nameserver\ +(.+) ]]; then
+                ns="${BASH_REMATCH[1]}"
+                if [[ "$ns" != "127.0.0.1" && "$ns" != "127.0.0.53" && "$ns" != "::1" ]]; then
+                    dns_servers+=("$ns")
+                fi
+            fi
+        done < /etc/resolv.conf
+    fi
+
+    # Default fallbacks
+    if [[ ${#dns_servers[@]} -eq 0 ]]; then
+        dns_servers=("8.8.8.8" "1.1.1.1")
+    fi
+
+    printf '%s\n' "${dns_servers[@]}"
+}
+
+configure_dnsmasq() {
+    info "Configuring dnsmasq..."
+
+    local upstream
+    upstream=$(cat "$UPSTREAM_DNS_FILE")
+
+    cat > "$DNSMASQ_CONF" <<- EOF
+# .ptd local TLD configuration
+# Created by ptd on $(date)
+
+# Listen on localhost only
+listen-address=127.0.0.1
+bind-interfaces
+port=53
+
+# Disable DHCP on loopback
+no-dhcp-interface=lo
+
+# Security hardening
+domain-needed
+bogus-priv
+no-resolv
+
+# Cache settings
+cache-size=1000
+neg-ttl=60
+
+# Wildcard .ptd -> 127.0.0.1
+address=/ptd/127.0.0.1
+
+# Upstream DNS servers
+EOF
+
+    while IFS= read -r ns; do
+        [[ -z "$ns" ]] && continue
+        echo "server=$ns" >> "$DNSMASQ_CONF"
+    done <<< "$upstream"
+
+    success "dnsmasq config written: $DNSMASQ_CONF"
+}
+
+configure_system_dns() {
+    info "Configuring system DNS to use local dnsmasq (127.0.0.1)..."
+
+    mkdir -p "$STATE_DIR"
+    : > "$ORIG_DNS_FILE"   # clear file
+
+    if command -v nmcli &>/dev/null && nmcli -t -f RUNNING general 2>/dev/null | grep -q running; then
+        info "NetworkManager detected — updating connection DNS settings..."
+
+        local connections
+        connections=$(nmcli -t -f NAME con show --active 2>/dev/null || true)
+
+        if [[ -z "$connections" ]]; then
+            warn "No active NetworkManager connections found."
+            warn "DNS changes will not take effect until a connection is active."
+            return
+        fi
+
+        while IFS= read -r conn; do
+            [[ -z "$conn" ]] && continue
+
+            local orig_dns orig_ignore
+            orig_dns=$(nmcli -g ipv4.dns con show "$conn" 2>/dev/null || true)
+            orig_ignore=$(nmcli -g ipv4.ignore-auto-dns con show "$conn" 2>/dev/null || true)
+
+            echo "CONN:$conn|dns=$orig_dns|ignore-auto=$orig_ignore" >> "$ORIG_DNS_FILE"
+
+            nmcli con mod "$conn" ipv4.dns "127.0.0.1" 2>/dev/null
+            nmcli con mod "$conn" ipv4.ignore-auto-dns yes 2>/dev/null
+            info "  Updated connection: $conn"
+        done <<< "$connections"
+
+        info "Restarting connections to apply DNS changes..."
+        while IFS= read -r conn; do
+            [[ -z "$conn" ]] && continue
+            nmcli con down "$conn" 2>/dev/null || true
+            nmcli con up "$conn" 2>/dev/null || true
+        done <<< "$connections"
+
+    elif [[ -f /etc/sysconfig/network/config ]]; then
+        info "Using netconfig to set DNS..."
+
+        local orig
+        orig=$(grep '^NETCONFIG_DNS_STATIC_SERVERS=' /etc/sysconfig/network/config 2>/dev/null | sed 's/^NETCONFIG_DNS_STATIC_SERVERS=//' | tr -d '"')
+        echo "NETCONFIG:$orig" >> "$ORIG_DNS_FILE"
+
+        sed -i 's/^NETCONFIG_DNS_STATIC_SERVERS=.*/NETCONFIG_DNS_STATIC_SERVERS="127.0.0.1"/' /etc/sysconfig/network/config
+        netconfig update 2>/dev/null || true
+
+    else
+        warn "Could not detect NetworkManager or netconfig."
+        warn "Please manually set your system DNS to 127.0.0.1 (first nameserver)."
+    fi
+
+    success "System DNS configured to use 127.0.0.1"
+}
+
+restore_system_dns() {
+    if [[ ! -f "$ORIG_DNS_FILE" ]]; then
+        warn "No saved DNS configuration found; nothing to restore."
+        return
+    fi
+
+    info "Restoring original system DNS settings..."
+
+    if command -v nmcli &>/dev/null && nmcli -t -f RUNNING general 2>/dev/null | grep -q running; then
+        while IFS='|' read -r entry; do
+            [[ -z "$entry" ]] && continue
+            if [[ "$entry" =~ ^CONN:(.+)\|dns=(.*)\|ignore-auto=(.*)$ ]]; then
+                local conn="${BASH_REMATCH[1]}"
+                local orig_dns="${BASH_REMATCH[2]}"
+                local orig_ignore="${BASH_REMATCH[3]}"
+
+                if [[ -n "$orig_dns" ]]; then
+                    nmcli con mod "$conn" ipv4.dns "$orig_dns" 2>/dev/null || true
+                else
+                    nmcli con mod "$conn" ipv4.dns "" 2>/dev/null || true
+                fi
+
+                if [[ -n "$orig_ignore" ]]; then
+                    nmcli con mod "$conn" ipv4.ignore-auto-dns "$orig_ignore" 2>/dev/null || true
+                else
+                    nmcli con mod "$conn" ipv4.ignore-auto-dns no 2>/dev/null || true
+                fi
+
+                nmcli con down "$conn" 2>/dev/null || true
+                nmcli con up "$conn" 2>/dev/null || true
+            fi
+        done < "$ORIG_DNS_FILE"
+
+    elif [[ -f /etc/sysconfig/network/config ]]; then
+        local orig
+        orig=$(grep '^NETCONFIG:' "$ORIG_DNS_FILE" 2>/dev/null | sed 's/^NETCONFIG://')
+        if [[ -n "$orig" ]]; then
+            sed -i "s/^NETCONFIG_DNS_STATIC_SERVERS=.*/NETCONFIG_DNS_STATIC_SERVERS=\"$orig\"/" /etc/sysconfig/network/config
+        else
+            sed -i 's/^NETCONFIG_DNS_STATIC_SERVERS=.*/NETCONFIG_DNS_STATIC_SERVERS=""/' /etc/sysconfig/network/config
+        fi
+        netconfig update 2>/dev/null || true
+    fi
+
+    rm -f "$ORIG_DNS_FILE"
+    success "System DNS restored"
+}
+
+# ---------------------------------------------------------------------------
+# Web server
+# ---------------------------------------------------------------------------
+configure_nginx() {
+    info "Configuring nginx..."
+
+    mkdir -p "$PTD_ROOT/_static"
+
+    # Create license agreement page
+    cat > "$PTD_ROOT/_static/license.html" <<- 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>License Agreement — .ptd</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0d1117;
+  color: #e0e0e0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 12px;
+  padding: 2.5em 3em;
+  max-width: 680px;
+  width: 90%;
+  margin: 2em auto;
+}
+h1 { font-size: 1.8em; color: #58a6ff; margin-bottom: 0.3em; }
+.tag { color: #8b949e; font-size: 0.85em; margin-bottom: 1.5em; display: block; }
+p { line-height: 1.7; margin: 1em 0; color: #c9d1d9; }
+.terms {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 1.2em 1.5em;
+  margin: 1.5em 0;
+  font-size: 0.9em;
+  max-height: 240px;
+  overflow-y: auto;
+  color: #8b949e;
+}
+.terms strong { color: #c9d1d9; }
+.btn-agree {
+  display: inline-block;
+  width: 100%;
+  padding: 0.9em;
+  background: #238636;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 1.1em;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+  text-decoration: none;
+  transition: background 0.2s;
+}
+.btn-agree:hover { background: #2ea043; text-decoration: none; }
+.btn-agree:visited { color: #fff; }
+footer { margin-top: 1.5em; font-size: 0.8em; color: #484f58; text-align: center; }
+a { color: #58a6ff; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>.PTD Domain License</h1>
+<span class="tag">You must accept to access this domain</span>
+
+<p>
+  This .PTD (PalmtreeDev Domain) system is provided under the
+  <strong>Apache License, Version 2.0</strong>.
+  By continuing, you agree to its terms.
+</p>
+
+<div class="terms">
+<strong>Apache License, Version 2.0 — Summary</strong><br><br>
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:<br><br>
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.<br><br>
+<strong>Disclaimer:</strong> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY
+OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE.
+</div>
+
+<a class="btn-agree" href="/__ptd-accept-license">I Agree — Access the Domain</a>
+
+<footer>
+  <a href="https://www.apache.org/licenses/LICENSE-2.0" target="_blank" rel="noopener">
+    Full Apache 2.0 License
+  </a>
+</footer>
+</div>
+</body>
+</html>
+EOF
+
+    cat > "$NGINX_CONF" <<- 'EOF'
+# .ptd local TLD configuration
+# Created by ptd
+
+# Bare ptd domain
+server {
+    listen 80;
+    server_name ptd;
+
+    # License agreement (no cookie check)
+    location = /__ptd-license.html {
+        alias /var/www/ptd/_static/license.html;
+    }
+    # License acceptance endpoint
+    location = /__ptd-accept-license {
+        add_header Set-Cookie "ptd_license=accepted; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax";
+        return 302 /;
+    }
+    # Everything else requires license acceptance
+    location / {
+        if ($cookie_ptd_license != "accepted") {
+            return 302 /__ptd-license.html;
+        }
+        root /var/www/ptd;
+        index index.html index.htm;
+        try_files $uri $uri/ =404;
+    }
+}
+
+# Wildcard *.ptd — captures single-level subdomain
+server {
+    listen 80;
+    server_name ~^(?<subdomain>[^.]+)\.ptd$;
+
+    # License agreement (no cookie check)
+    location = /__ptd-license.html {
+        alias /var/www/ptd/_static/license.html;
+    }
+    # License acceptance endpoint
+    location = /__ptd-accept-license {
+        add_header Set-Cookie "ptd_license=accepted; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax";
+        return 302 /;
+    }
+    # Everything else requires license acceptance
+    location / {
+        if ($cookie_ptd_license != "accepted") {
+            return 302 /__ptd-license.html;
+        }
+        root /var/www/ptd/$subdomain;
+        index index.html index.htm;
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+}
+EOF
+
+    if [[ ! -f "$PTD_ROOT/index.html" ]]; then
+        cat > "$PTD_ROOT/index.html" <<- 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>.ptd Local Domain Root</title>
+<style>
+body { font-family: system-ui, -apple-system, sans-serif; max-width: 640px; margin: 3em auto; padding: 0 2em; line-height: 1.6; color: #e0e0e0; background: #0d1117; }
+h1 { color: #58a6ff; }
+code { background: #21262d; padding: 0.2em 0.5em; border-radius: 4px; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 1em; border-radius: 6px; overflow-x: auto; }
+a { color: #58a6ff; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5em 2em; margin: 1.5em 0; }
+</style>
+</head>
+<body>
+<h1>.ptd Local Domain Root</h1>
+<div class="card">
+<p>Create a project with:</p>
+<pre>sudo ptd add &lt;project-name&gt;</pre>
+<p>Then visit:</p>
+<pre>http://&lt;project-name&gt;.ptd/</pre>
+<p><a href="/__ptd-accept-license">Re-accept the license</a></p>
+</div>
+</body>
+</html>
+EOF
+    fi
+
+    success "nginx config written: $NGINX_CONF"
+}
+
+# ---------------------------------------------------------------------------
+# Package management
+# ---------------------------------------------------------------------------
+install_packages() {
+    local pkgs=()
+
+    if ! command -v dnsmasq &>/dev/null; then
+        pkgs+=("dnsmasq")
+    fi
+    if ! command -v nginx &>/dev/null; then
+        pkgs+=("nginx")
+    fi
+
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        info "Installing packages: ${pkgs[*]}..."
+        zypper --non-interactive install "${pkgs[@]}" || die "Failed to install packages."
+        success "Packages installed."
+    else
+        info "Required packages already installed."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SELinux helpers
+# ---------------------------------------------------------------------------
+fix_selinux_context() {
+    local target="${1:-$PTD_ROOT}"
+    if command -v sestatus &>/dev/null && sestatus 2>/dev/null | grep -q 'enforcing'; then
+        info "SELinux enforcing — setting httpd_sys_content_t on $target"
+        if command -v chcon &>/dev/null; then
+            chcon -R -t httpd_sys_content_t "$target" 2>/dev/null && \
+                success "SELinux context set on $target" || \
+                warn "Failed to set SELinux context (run manually if needed)"
+            # Try to install policycoreutils for persistent labeling
+            if ! command -v restorecon &>/dev/null && command -v zypper &>/dev/null; then
+                zypper --non-interactive install -y policycoreutils 2>/dev/null || true
+            fi
+            if command -v semanage &>/dev/null && command -v restorecon &>/dev/null; then
+                semanage fcontext -a -t httpd_sys_content_t "${target}(/.*)?" 2>/dev/null || true
+                restorecon -R "$target" 2>/dev/null || true
+                success "Persistent SELinux rule added"
+            fi
+        else
+            warn "chcon not found. Install policycoreutils: sudo zypper install policycoreutils"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Service helpers
+# ---------------------------------------------------------------------------
+enable_and_start() {
+    local svc="$1"
+    systemctl enable "$svc" 2>/dev/null || true
+    systemctl restart "$svc" 2>/dev/null || warn "Failed to start $svc (check: journalctl -u $svc)"
+    if systemctl is-active --quiet "$svc"; then
+        success "$svc is running"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+show_license() {
+    if command -v less &>/dev/null; then
+        echo ""
+        echo "Press 'q' to exit the license viewer, then type 'yes' to accept."
+        echo ""
+        sleep 1
+        cat << 'EOF' | less
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory, whether in tort
+      (including negligence), contract, or otherwise, unless required by
+      applicable law (such as deliberate and grossly negligent acts) or
+      agreed to in writing, shall any Contributor be liable to You for
+      damages, including any direct, indirect, special, incidental, or
+      consequential damages of any character arising as a result of this
+      License or out of the use or inability to use the Work (including but
+      not limited to damages for loss of goodwill, work stoppage, computer
+      failure or malfunction, or any and all other commercial damages or
+      losses), even if such Contributor has been advised of the possibility
+      of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+EOF
+        echo ""
+    else
+        cat << 'EOF'
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   Full license text available at:
+   https://www.apache.org/licenses/LICENSE-2.0
+EOF
+        echo ""
+    fi
+}
+
+prompt_license() {
+    echo -e "${YELLOW}========================================${NC}"
+    echo -e "${YELLOW} License Agreement${NC}"
+    echo -e "${YELLOW}========================================${NC}"
+    echo ""
+    echo "This .PTD (PalmtreeDev Domain) system is provided under the"
+    echo "Apache License, Version 2.0."
+    echo ""
+    echo "You must read and accept the license terms before installing."
+    echo ""
+
+    while true; do
+        read -r -p "Do you accept the Apache License 2.0? (yes/no): " answer
+        case "$answer" in
+            yes|Yes|YES|y|Y)
+                echo ""
+                success "License accepted. Proceeding with installation..."
+                echo ""
+                return 0
+                ;;
+            no|No|NO|n|N)
+                echo ""
+                die "License rejected. Installation cancelled."
+                ;;
+            *)
+                echo "Please answer 'yes' or 'no'."
+                ;;
+        esac
+    done
+}
+
+cmd_install() {
+    check_root install
+
+    show_license
+    prompt_license
+
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN} .ptd Local TLD Installer${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo ""
+
+    install_packages
+
+    mkdir -p "$STATE_DIR"
+
+    # Detect and save upstream DNS before making any changes
+    info "Detecting upstream DNS servers..."
+    detect_upstream_dns > "$UPSTREAM_DNS_FILE"
+    local count
+    count=$(wc -l < "$UPSTREAM_DNS_FILE")
+    info "  Found $count upstream DNS server(s)"
+
+    configure_dnsmasq
+
+    # Check port 53 before starting dnsmasq
+    if command -v ss &>/dev/null && ss -tlnp 'sport = :domain' 2>/dev/null | grep -q LISTEN; then
+        warn "Port 53 (DNS) is already in use:"
+        ss -tlnp 'sport = :domain' 2>/dev/null | head -3
+        warn "dnsmasq may fail to start. Check: journalctl -u dnsmasq"
+    fi
+
+    enable_and_start dnsmasq
+
+    # Ensure dnsmasq is running before changing system DNS
+    if ! systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        die "dnsmasq failed to start. Check: journalctl -u dnsmasq -n 30 --no-pager"
+    fi
+
+    configure_system_dns
+
+    configure_nginx
+    fix_selinux_context "$PTD_ROOT"
+    enable_and_start nginx
+
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN} Installation complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "  Create a project:   sudo ptd add myproject"
+    echo "  Visit it at:        http://myproject.ptd/"
+    echo "  List projects:      ptd list"
+    echo "  Check status:       ptd status"
+    echo "  Remove all:         sudo ptd uninstall"
+    echo ""
+}
+
+cmd_uninstall() {
+    check_root uninstall
+
+    echo ""
+    echo -e "${YELLOW}========================================${NC}"
+    echo -e "${YELLOW} .ptd Local TLD Uninstaller${NC}"
+    echo -e "${YELLOW}========================================${NC}"
+    echo ""
+
+    info "Stopping services..."
+    for svc in dnsmasq nginx; do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    done
+
+    info "Removing configuration files..."
+    rm -f "$DNSMASQ_CONF"
+    rm -f "$NGINX_CONF"
+
+    restore_system_dns
+
+    rm -rf "$STATE_DIR"
+
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN} Uninstall complete${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "  Configuration files removed."
+    echo "  DNS settings restored."
+    echo ""
+    echo "  Packages were NOT removed. To remove them:"
+    echo "    sudo zypper rm dnsmasq nginx"
+    echo ""
+    echo "  Project files were NOT removed. To remove them:"
+    echo "    sudo rm -rf $PTD_ROOT"
+    echo ""
+}
+
+cmd_add() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        die "Usage: ptd add <project-name>"
+    fi
+
+    if [[ ! "$name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+        die "Invalid project name. Use only letters, numbers, and hyphens (no leading/trailing hyphens)."
+    fi
+
+    local project_dir="$PTD_ROOT/$name"
+
+    if [[ -d "$project_dir" ]]; then
+        die "Project '$name' already exists at $project_dir"
+    fi
+
+    mkdir -p "$project_dir"
+
+    cat > "$project_dir/index.html" <<- EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$name.ptd</title>
+<style>
+body { font-family: system-ui, -apple-system, sans-serif; max-width: 640px; margin: 3em auto; padding: 0 2em; line-height: 1.6; color: #e0e0e0; background: #0d1117; }
+h1 { color: #58a6ff; }
+code { background: #21262d; padding: 0.2em 0.5em; border-radius: 4px; }
+a { color: #58a6ff; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5em 2em; margin: 1.5em 0; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>$name.ptd</h1>
+<p>Welcome to <strong>$name.ptd</strong>!</p>
+<p>Edit files in <code>$project_dir</code></p>
+<p>License: <a href="https://www.apache.org/licenses/LICENSE-2.0" target="_blank" rel="noopener">Apache 2.0</a></p>
+</div>
+</body>
+</html>
+EOF
+
+    chmod 755 "$project_dir"
+    chmod 644 "$project_dir/index.html"
+    fix_selinux_context "$project_dir"
+
+    echo ""
+    echo -e "${GREEN}Project created!${NC}"
+    echo "  Directory: $project_dir"
+    echo "  URL:       http://$name.ptd/"
+    echo ""
+}
+
+cmd_remove() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        die "Usage: ptd remove <project-name>"
+    fi
+
+    local project_dir="$PTD_ROOT/$name"
+
+    if [[ ! -d "$project_dir" ]]; then
+        die "Project '$name' not found at $project_dir"
+    fi
+
+    rm -rf "$project_dir"
+    echo "Project '$name' removed."
+}
+
+cmd_list() {
+    if [[ ! -d "$PTD_ROOT" ]]; then
+        echo "No .ptd projects directory found."
+        echo "Run 'sudo ptd install' to set up .ptd support."
+        exit 0
+    fi
+
+    local projects
+    projects=$(find "$PTD_ROOT" -maxdepth 1 -mindepth 1 -type d | sort)
+
+    if [[ -z "$projects" ]]; then
+        echo "No .ptd projects found."
+        echo "Create one with: sudo ptd add <project-name>"
+        exit 0
+    fi
+
+    echo ""
+    echo -e "${CYAN}.ptd Projects:${NC}"
+    echo ""
+    printf "  %-24s %s\n" "Name" "URL"
+    printf "  %-24s %s\n" "----" "---"
+    while IFS= read -r proj; do
+        local name
+        name=$(basename "$proj")
+        printf "  %-24s http://%s.ptd/\n" "$name" "$name"
+    done <<< "$projects"
+    echo ""
+}
+
+cmd_status() {
+    echo ""
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN} .ptd Status${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo ""
+
+    printf "  %-20s" "dnsmasq:"
+    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        echo -e " ${GREEN}ACTIVE${NC}"
+    else
+        echo -e " ${RED}INACTIVE${NC} (run: sudo ptd install)"
+    fi
+
+    printf "  %-20s" "nginx:"
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        echo -e " ${GREEN}ACTIVE${NC}"
+    else
+        echo -e " ${RED}INACTIVE${NC} (run: sudo ptd install)"
+    fi
+
+    echo ""
+    printf "  %-20s" "DNS (.ptd):"
+    if command -v host &>/dev/null; then
+        if host test.ptd 127.0.0.1 &>/dev/null; then
+            echo -e " ${GREEN}WORKING${NC} (test.ptd -> 127.0.0.1)"
+        else
+            echo -e " ${RED}NOT RESOLVING${NC}"
+        fi
+    elif command -v nslookup &>/dev/null; then
+        if nslookup test.ptd 127.0.0.1 &>/dev/null; then
+            echo -e " ${GREEN}WORKING${NC} (test.ptd -> 127.0.0.1)"
+        else
+            echo -e " ${RED}NOT RESOLVING${NC}"
+        fi
+    else
+        echo "install bind-utils to verify"
+    fi
+
+    echo ""
+    local project_count=0
+    if [[ -d "$PTD_ROOT" ]]; then
+        project_count=$(find "$PTD_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    fi
+    echo "  Projects:      $project_count"
+
+    if [[ $project_count -gt 0 ]]; then
+        echo ""
+        echo "  Projects:"
+        while IFS= read -r proj; do
+            local name
+            name=$(basename "$proj")
+            echo "    - http://$name.ptd/"
+        done < <(find "$PTD_ROOT" -maxdepth 1 -mindepth 1 -type d | sort)
+    fi
+    echo ""
+}
+
+cmd_restart() {
+    check_root restart
+
+    info "Restarting services..."
+    for svc in dnsmasq nginx; do
+        systemctl restart "$svc" 2>/dev/null && success "$svc restarted" || warn "Failed to restart $svc"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        install)
+            cmd_install "$@"
+            ;;
+        uninstall)
+            cmd_uninstall "$@"
+            ;;
+        add)
+            check_root add
+            cmd_add "$@"
+            ;;
+        remove)
+            check_root remove
+            cmd_remove "$@"
+            ;;
+        list)
+            cmd_list "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        restart)
+            cmd_restart "$@"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            die "Unknown command: $cmd. Use 'ptd help' for usage."
+            ;;
+    esac
+}
+
+main "$@"
